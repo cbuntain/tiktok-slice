@@ -1,0 +1,14 @@
+generation_strategy: 'all'
+num_time: 10
+time_unit: 'm'
+num_workers: 32
+reqs_per_ip: 20
+batch_size: 8000
+task_batch_size: 128
+task_nthreads: 4
+task_timeout: 200
+max_task_tries: 16
+worker_cpu: null
+worker_mem: null
+cluster_type: 'local'
+method: 'dask'

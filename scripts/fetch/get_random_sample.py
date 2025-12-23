@@ -332,6 +332,7 @@ async def process_future(f, batch_tasks_lookup, timeout, max_task_tries, tasks_p
     except Exception as e:
         batch_results = [{'return': None, 'exception': e, 'pre_time': None, 'post_time': datetime.datetime.now()} for _ in batch_tasks]
     assert len(batch_tasks) == len(batch_results), "Number of tasks and results must match"
+
     for t, r in zip(batch_tasks, batch_results):
         if r['exception'] is not None:
             r['exception'] = str(r['exception'])[:100]
@@ -413,9 +414,10 @@ class TaskDataset:
             schema={
                 'args': pl.UInt64, 
                 'result': pl.Struct({
-                    'return': pl.Struct, 
+                    'return': pl.Struct({'id': pl.Int64, 'statusCode': pl.Int64, 'statusMsg': pl.String, 'json': pl.String}), 
                     'post_time': pl.Datetime, 
-                    'pre_time': pl.Datetime
+                    'pre_time': pl.Datetime,
+                    'exception': pl.String,
                 }), 
                 'exceptions': pl.List(pl.Struct({'exception': pl.String, 'pre_time': pl.Datetime, 'post_time': pl.Datetime})), 
                 'completed': pl.Boolean
@@ -474,6 +476,8 @@ class TaskDataset:
             },
             schema_overrides=self.tasks.schema
         )
+
+        #print(updates_df)
         
         # Update the existing DataFrame using join and coalesce
         self.tasks = self.tasks.join(
@@ -501,8 +505,8 @@ async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_si
     interface_ratios = [1.0] if cluster_type in ['ssh', 'slurm'] else [1]
     assert all(int(ratio * task_nthreads) > 0 for ratio in interface_ratios), "Must have at least one thread per network interface"
     function = MultiNetworkInterfaceFunc(DaskFunc(function), network_interfaces=network_interfaces, ratios=interface_ratios, task_nthreads=task_nthreads)
-    # network_interface = None # 'wlan0' if cluster_type == 'raspi' else None
-    # function = BatchNetworkInterfaceFunc(DaskFunc(function), network_interface=network_interface, task_nthreads=task_nthreads)
+    #network_interface = None # 'wlan0' if cluster_type == 'raspi' else None
+    #function = BatchNetworkInterfaceFunc(DaskFunc(function), network_interface=network_interface, task_nthreads=task_nthreads)
     dotenv.load_dotenv()
     tasks_progress_bar = tqdm(total=dataset.num_left(), desc="All Tasks")
     batch_progress_bar = tqdm(total=min(batch_size, dataset.num_left()), desc="Batch Tasks", leave=False)
@@ -559,6 +563,7 @@ async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_si
                                 await asyncio.wait_for(get_results(task_futures, batch_tasks_lookup, timeout, max_task_tries, tasks_progress_bar, exception_counter), timeout=timeout)
                             except Exception as e:
                                 # cancel all the unfinished tasks, and add the exceptions to the task
+                                raise(e)
                                 for f in task_futures:
                                     await process_future(f, batch_tasks_lookup, timeout, max_task_tries, tasks_progress_bar, exception_counter, cancel_if_unfinished=True)
 
@@ -681,16 +686,27 @@ class ProcessVideo:
             raise InvalidResponseException(
                 "Could not find normal JSON section in returned HTML."
             )
+
+        video_item = {}
         video_detail = json.loads(self.text)
+        video_item["json"] = self.text
+        video_item["statusCode"] = 0
+        video_item["statusMsg"] = None
         if video_detail.get("statusCode", 0) != 0: # assume 0 if not present
+            video_item["id"] = None
+            video_item["statusCode"] = video_detail.get("statusCode")
+            video_item["statusMsg"] = video_detail.get("statusMsg")
+
             # TODO retry when status indicates server error
-            return video_detail
-        video_info = video_detail.get("itemInfo", {}).get("itemStruct")
-        if video_info is None:
+            return video_item
+        video_info = video_detail.get("itemInfo", {}).get("itemStruct", {})
+
+        video_item["id"] = video_info.get("id")
+        if video_detail is None:
             raise InvalidResponseException(
-                video_detail, "TikTok JSON did not contain expected JSON."
+                video_item, "TikTok JSON did not contain expected JSON."
             )
-        return video_info
+        return video_item
 
 def process_video(text, headers=None):
     video_processor = ProcessVideo(headers=headers)
@@ -771,6 +787,7 @@ class PyCurlClient:
 
 
 def get_video(video_id, network_interface):
+
     url = f"https://www.tiktok.com/@/video/{video_id}"
     headers = get_headers()
     
@@ -920,10 +937,17 @@ async def get_random_sample(
     potential_video_bits = [''.join(bits) for bits in potential_video_bits]
     potential_video_ids = [int(bits, 2) for bits in potential_video_bits]
 
+    print("Length of potential IDs:", len(potential_video_ids))
+    for v in potential_video_ids[:5]:
+        print("\t", v)
+
+    #potential_video_ids =  potential_video_ids[:10] + [7581609282748124446]
+
     date_dir = start_time.strftime('%Y_%m_%d')
     results_dir_path = os.path.join(this_dir_path, '..', '..', 'data', 'results', date_dir, 'hours', str(start_time.hour), str(start_time.minute), str(start_time.second))
     
     if os.path.exists(results_dir_path) and os.path.exists(os.path.join(results_dir_path, 'results.parquet.gzip')):
+        print("Checking for already collected!")
         # remove ids that have already been collected
         try:
             existing_df = pl.read_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'))
@@ -933,6 +957,7 @@ async def get_random_sample(
             dataset.add_potential_ids(potential_video_ids)
         else:
             dataset = TaskDataset()
+            print("LOADING PREVIOUS DATASET!")
             dataset.load_existing_df(existing_df)
 
             # add ids that haven't been collected
@@ -945,8 +970,10 @@ async def get_random_sample(
                 print("All potential video IDs have been collected")
                 return
     else:
+        print("STARTING NEW COLLECTION")
         dataset = TaskDataset()
         dataset.add_potential_ids(potential_video_ids)
+        print(dataset)
 
     if method == 'async':
         raise NotImplementedError("Async method not implemented")
@@ -972,6 +999,9 @@ async def get_random_sample(
     else:
         raise ValueError("Invalid method")
     results = dataset.tasks
+    print(results)
+    dataset.tasks.write_ndjson("dataset_tasks.log.jsonl")
+
     num_hits = len(dataset.tasks.filter(pl.col('result').struct.field('return').struct.field('id').is_not_null()))
     num_valid = len(results.filter(pl.col('result').map_elements(lambda x: x is not None and x['return'] is not None, pl.Boolean)))
     print(f"Num hits: {num_hits}, Num valid: {num_valid}, Num potential video IDs: {len(dataset)}")
@@ -1011,11 +1041,12 @@ async def get_random_sample(
 
     
 async def run_random_sample(config):
+    print(config)
     num_time = 1
-    time_unit = 'h'
+    time_unit = 'm'
     generation_strategy = 'all'
     # TODO run at persistent time after collection, i.e. if collection takes an hour, run after 24s after post time
-    start_time = datetime.datetime(2024, 4, 10, 19, 1, 28)
+    start_time = datetime.datetime(2025, 12, 10, 0, 0, 0)
     if (num_time > 1 and time_unit == 's') or (time_unit == 'm') or (time_unit == 'h'):
         if time_unit == 's':
             num_seconds = num_time
@@ -1150,11 +1181,12 @@ async def async_main(config):
     # logging.basicConfig(level=logging.DEBUG)
     dotenv.load_dotenv()
     await run_random_sample(config)
-    await run_min_each_hour_sample(config)
+    # await run_min_each_hour_sample(config)
     # await run_get_ips()
 
-@hydra.main(config_path='../../config', config_name='config')
+@hydra.main(version_base=None, config_path='../../config', config_name='config')
 def main(config):
+    print(config)
     asyncio.run(async_main(config))
 
 if __name__ == '__main__':

@@ -13,3 +13,6 @@ toolz==0.12.1
 tornado==6.4
 asyncssh
 randmac
+hydra-core
+polars
+pycurl
